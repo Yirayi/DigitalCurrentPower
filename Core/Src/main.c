@@ -80,29 +80,45 @@ char msg2[30] = "";
 char msg3[20] = "";
 char msg4[20] = "";
 //----------------------------ADC----------------------------
-uint16_t Vinadc = 0;
+uint16_t Vinadc[10] = {0};
+
 //INA226电压修正
-#define INA226_VOLTAGE_SCALE  1.006f
+#define INA226_VOLTAGE_SCALE  (0.9977f)
 //---------------------------------keyboard--------------------------------------------------------------
 char Isetbuffer[4] = {0,0,0,0};
 short Ibuffercounter = 0;
 char key = 0;
 //--------------------------------------控制--------------------------------------------------------------
-#define PID_KP          50.0f
-#define PID_KI          10.0f
-#define PID_KD           5.0f
-#define PID_TS           0.133f
-#define PID_DUTY_MIN    0UL
-#define PID_DUTY_MAX    1439UL
-#define PID_INT_LIMIT   (PID_DUTY_MAX / PID_KI)
-#define PID_D_ALPHA      0.3f
-#define DEFAULT_DUTY    0.8
+#define PID_KP_BASE      50.0f
+#define PID_KI_BASE      20.0f
+#define PID_KD_BASE       5.0f
+#define PID_TS            0.133f
+#define PID_DUTY_MIN      0UL
+#define PID_DUTY_MAX      1439UL
+#define PID_INT_LIMIT    (PID_DUTY_MAX / PID_KI_BASE)
+#define PID_D_ALPHA       0.3f
+#define DEFAULT_DUTY      0.8f
+
+/* 增益调度参数 */
+#define R_REF             5.0f    /* 参考电阻（量程中点），增益基准点 */
+#define R_CLAMP_LOW       2.0f    /* 电阻下限：低于此值按0.8Ω计算，防止增益过小 */
+#define R_CLAMP_HIGH     10.0f    /* 电阻上限：高于此值按10Ω计算，防止增益过大 */
+
+/* 误差非线性增益参数 */
+#define E_BOOST_HALF      0.15f   /* 误差达到此值时Kp增益为基准的1.5倍（半增益点）*/
+#define E_BOOST_MAX       1.8f    /* Kp误差增益最大倍数，不超过1.8以防振荡 */
 
 float error = 0;
 static float pid_integral  = 0.0f;
 static float prev_error    = 0.0f;
 static float d_filtered    = 0.0f;
 
+float CVintegral = 0;
+float cverror;
+
+void CVPID_Reset(){
+	CVintegral = 0;
+}
 void PID_Reset(void)
 {
     pid_integral = 0.0f;
@@ -112,7 +128,7 @@ void PID_Reset(void)
 
 
 float Iset = 1.0;
-static uint32_t pwm_duty = PID_DUTY_MAX;
+static float pwm_duty = PID_DUTY_MAX;
 //-------------------------------------控制函数-------------------------------------------------------------
 static float clampf(float v, float lo, float hi)
 {
@@ -126,44 +142,86 @@ static void Set_PWM_Duty(uint32_t duty)
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, duty);
     pwm_duty = duty;
 }
+/**
+ * @brief  获取当前负载电阻估计值（带保护）
+ * @return 钳位后的电阻值（Ω），用于增益调度
+ */
+static float Get_R_Estimate(void)
+{
+    float I = ina226_data.current_A;
+    float V = ina226_data.voltage_V*INA226_VOLTAGE_SCALE;
+
+    /* 电流过小时电阻计算不可信，返回参考值 */
+    if (I < 0.05f) return R_REF;
+
+    float R = V / I;
+    return clampf(R, R_CLAMP_LOW, R_CLAMP_HIGH);
+}
+/**
+ * @brief  自适应PID更新
+ *
+ * 增益调度策略：
+ *   gain_R   = R_est / R_REF        线性调度，随负载等比缩放所有系数
+ *   gain_E   = 平滑非线性函数         大误差时适度提升Kp，加快初始响应
+ *
+ * 仅Kp叠加误差增益；Ki/Kd只做电阻调度，避免积分饱和与微分噪声
+ */
 void PID_Update(float current_A)
 {
     /* ---------- 误差 ---------- */
-    float error = Iset - current_A;
+    float err = Iset - current_A;
+    error = err;  /* 供OLED调试显示 */
 
-    /* ---------- 积分项：梯形/矩形积分 + 限幅防饱和 ---------- */
-    pid_integral += error * PID_TS;
-    pid_integral  = clampf(pid_integral, -PID_INT_LIMIT, PID_INT_LIMIT);
+    /* ---------- 电阻增益调度 ---------- */
+    float R_est    = Get_R_Estimate();
+    float gain_R   = R_est / R_REF;   /* 2Ω→0.4x，5Ω→1.0x，10Ω→2.0x */
 
-    /* ---------- 微分项：差分 + 一阶低通滤波 ----------
-     *   d_filtered = α·d_raw + (1-α)·d_filtered_prev
-     *   α=0.3：仅 30% 权重给新值，有效抑制高频噪声
-     * ------------------------------------------------- */
-    float d_raw  = (error - prev_error) / PID_TS;
-    d_filtered   = PID_D_ALPHA * d_raw + (1.0f - PID_D_ALPHA) * d_filtered;
-    prev_error   = error;                  /* 更新历史误差 */
+    /* ---------- 误差非线性增益（仅作用于Kp）----------
+     *
+     * 采用平滑饱和函数：
+     *   gain_E = 1 + (|e| / (|e| + E_BOOST_HALF)) × (E_BOOST_MAX - 1)
+     *
+     * |e|=0         → gain_E = 1.0  （无增强，稳态精确）
+     * |e|=E_BOOST_HALF → gain_E = 1.4  （半增益点）
+     * |e|→∞        → gain_E = E_BOOST_MAX = 1.8（上限，防振荡）
+     */
+    float abs_err  = fabsf(err);
+    float gain_E   = 1.0f
+                   + (abs_err / (abs_err + E_BOOST_HALF))
+                   * (E_BOOST_MAX - 1.0f);
+
+    /* ---------- 动态系数 ---------- */
+    float Kp_dyn = PID_KP_BASE * gain_R * gain_E;  /* 电阻 + 误差双重调度 */
+    float Ki_dyn = PID_KI_BASE * gain_R;            /* 仅电阻调度 */
+    float Kd_dyn = PID_KD_BASE * gain_R;            /* 仅电阻调度 */
+
+    /* ---------- 积分项（限幅防饱和，限幅随增益动态调整）---------- */
+    float int_limit = (float)PID_DUTY_MAX / Ki_dyn;
+    pid_integral   += clampf(err * PID_TS,-0.005,0.005);
+    pid_integral    = clampf(pid_integral, -int_limit, int_limit);
+
+    /* ---------- 微分项（差分 + 一阶低通滤波）---------- */
+    float d_raw  = (err - prev_error) / PID_TS;
+    d_filtered   = PID_D_ALPHA * d_raw
+                 + (1.0f - PID_D_ALPHA) * d_filtered;
+    prev_error   = err;
 
     /* ---------- 输出合成 ---------- */
-    float output = PID_KP * error
-                 + PID_KI * pid_integral
-                 + PID_KD * d_filtered;
+    float output = Kp_dyn * err
+                 + Kd_dyn * d_filtered;
 
-    /*
-     * output > 0 → 电流不足 → 减小 duty → Vout 升高 → 电流上升
-     * output < 0 → 电流过大 → 增大 duty → Vout 降低 → 电流下降
-     */
-    float new_duty = (float)pwm_duty - output;
-    Set_PWM_Duty((uint32_t)clampf(new_duty, PID_DUTY_MIN, PID_DUTY_MAX));
+    float new_duty = (float)pwm_duty - output - Ki_dyn * pid_integral;
+    Set_PWM_Duty((uint32_t)clampf(new_duty,
+                                   (float)PID_DUTY_MIN,
+                                   (float)PID_DUTY_MAX));
 }
 static void CV_Update(float voltage_V)
 {
-	static float CVintegral = 0;
-
-    float cverror = 18.0f - voltage_V;
-    CVintegral += cverror * 0.133f;
+    cverror = 18.0f - voltage_V;
+    CVintegral += clampf(cverror * 0.133f,-0.005,0.005);
     CVintegral = clampf(CVintegral, -200.0f, 200.0f);
-    float new_duty = (int32_t)pwm_duty - (float)(cverror * 5.0f) - CVintegral*1;
-    Set_PWM_Duty((uint32_t)clampf((float)new_duty, 0.0f, 719.0f));
+    float new_duty = (int32_t)pwm_duty - (float)(cverror * 10.0f);
+    Set_PWM_Duty((uint32_t)clampf((float)new_duty- CVintegral*5,(float)PID_DUTY_MIN,(float)PID_DUTY_MAX));
 }
 void OledRefreshData(){
 //	sprintf(msg1,"%.2fA",Iset);
@@ -179,13 +237,13 @@ void OledRefreshData(){
 	sprintf(msg1,"Iset%.2fA",Iset);
 	sprintf(msg2,"Io:%.3fA Uo:%.2fV",ina226_data.current_A,ina226_data.voltage_V*INA226_VOLTAGE_SCALE);
 	sprintf(msg3,"Rload:%.2f Ohm",ina226_data.resistance_Ohm);
-	sprintf(msg4,"Ui:%.2fV Mode:%s",Vinadc * 6 *3.3f / 4095.0f,work_mode ==MODE_CC? "CC":"CV");
+	sprintf(msg4,"Ui:%.2fV Mode:%s",Vinadc[0] * 6 *3.3f / 4095.0f,work_mode ==MODE_CC? "CC":"CV");
 	OLED_NewFrame();
 	OLED_PrintString(0, 0 , msg1, &font16x16, OLED_COLOR_NORMAL);
 
-	OLED_PrintASCIIChar(80, 0 , Isetbuffer[0]=='/0'?'0':Isetbuffer[0], &afont16x8,OLED_COLOR_NORMAL);
-	OLED_PrintASCIIChar(95, 0 , Isetbuffer[1]=='/0'?'0':Isetbuffer[1], &afont16x8, OLED_COLOR_NORMAL);
-	OLED_PrintASCIIChar(110, 0 , Isetbuffer[2]=='/0'?'0':Isetbuffer[2], &afont16x8, OLED_COLOR_NORMAL);
+	OLED_PrintASCIIChar(80, 0 , Isetbuffer[0]=='/0'?'0':Isetbuffer[0], &afont16x8,Ibuffercounter==0?OLED_COLOR_REVERSED:OLED_COLOR_NORMAL);
+	OLED_PrintASCIIChar(95, 0 , Isetbuffer[1]=='/0'?'0':Isetbuffer[1], &afont16x8, Ibuffercounter==1?OLED_COLOR_REVERSED:OLED_COLOR_NORMAL);
+	OLED_PrintASCIIChar(110, 0 , Isetbuffer[2]=='/0'?'0':Isetbuffer[2], &afont16x8, Ibuffercounter==2?OLED_COLOR_REVERSED:OLED_COLOR_NORMAL);
 	OLED_PrintASCIIChar(88, 0 , '.'    , &afont16x8, OLED_COLOR_NORMAL);
 
 	OLED_PrintString(0, 20, msg2, &mediumfont, OLED_COLOR_NORMAL);
@@ -207,10 +265,10 @@ void OledDebugRefreshData(){
 	static int running = 0;
 	int compare = __HAL_TIM_GET_COMPARE(&htim1, TIM_CHANNEL_1);
 
-	sprintf(msg1,"Iset:%.2fA  %.2f",Iset,error);
+	sprintf(msg1,"Iset:%.2fA  %.2f",Iset,cverror);
 	sprintf(msg2,"Io:%.3fA Uo:%.2fV",ina226_data.current_A,ina226_data.voltage_V*INA226_VOLTAGE_SCALE);
 	sprintf(msg3,"compare:%d",compare);
-	sprintf(msg4,"%.3f",pid_integral);
+	sprintf(msg4,"%.3f",CVintegral);
 	OLED_NewFrame();
 	OLED_PrintString(0, 0 , msg1, &mediumfont, OLED_COLOR_NORMAL);
 	OLED_PrintString(0, 15 , msg2, &mediumfont, OLED_COLOR_NORMAL);
@@ -263,8 +321,7 @@ int main(void)
   	//PWM输出
 	HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
 	__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, DEFAULT_DUTY*PID_DUTY_MAX);
-	//ADC
-	HAL_ADCEx_Calibration_Start(&hadc1);
+
 	//其余外设初始化
 	HAL_Delay(50);
 
@@ -276,7 +333,9 @@ int main(void)
 	KBstatus = Keyboard_Init(&hi2c2);
 	initIset(Isetbuffer,&Ibuffercounter);
 	uint32_t last_poll_tick = 0;
-
+	//ADC
+	HAL_ADCEx_Calibration_Start(&hadc1);
+	HAL_ADC_Start_DMA(&hadc1, (uint32_t*)&Vinadc, 10);
 	//---------------------------------------------------------------
   /* USER CODE END 2 */
 
@@ -287,7 +346,6 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-
 	if (ina226_state == INA226_STATE_IDLE){
 		INA226_StartRead();
 	}
@@ -295,23 +353,39 @@ int main(void)
 		ina226_data.data_ready = 0;
 
 		float I = ina226_data.current_A;
-		float V = ina226_data.voltage_V;
+		float V = ina226_data.voltage_V*INA226_VOLTAGE_SCALE;
 
 		if (HAL_GPIO_ReadPin(IOEN_GPIO_Port, IOEN_Pin)==GPIO_PIN_SET){
-			/* 判断工作模式 */
-			if (V >= 18.0f){
-				work_mode = MODE_CV;
-				/* CV模式：维持18V */
-				CV_Update(V);
-				/* CV模式下积分清零，防止切回CC时积分饱和 */
-				pid_integral = 0.0f;
-			}
-			else
-			{
-				work_mode = MODE_CC;
-				/* CC模式：PID调节电流至Iset */
+			if(work_mode == MODE_CC){
+				if (V >= 18.0f&&ina226_data.resistance_Ohm*Iset>=17.9){
+					work_mode = MODE_CV;
+					CVPID_Reset();
+					continue;
+				}
 				PID_Update(I);
 			}
+			else{
+				if(ina226_data.resistance_Ohm*Iset<17.9){
+					work_mode = MODE_CC;
+					PID_Reset();
+					continue;
+				}
+				CV_Update(V);
+			}
+//			/* 判断工作模式 */
+//			if (V >= 18.0f){
+//				work_mode = MODE_CV;
+//				/* CV模式：维持18V */
+//				CV_Update(V);
+//				/* CV模式下积分清零，防止切回CC时积分饱和 */
+//				pid_integral = 0.0f;
+//			}
+//			else
+//			{
+//				work_mode = MODE_CC;
+//				/* CC模式：PID调节电流至Iset */
+//				PID_Update(I);
+//			}
 		}
 	}
 
@@ -334,8 +408,8 @@ int main(void)
 	OledRefreshData();
 	//OledDebugRefreshData();
 	OLED_ShowFrame();
-	HAL_GPIO_TogglePin(BoardLED_GPIO_Port, BoardLED_Pin);
-	HAL_Delay(50);
+	//HAL_GPIO_TogglePin(BoardLED_GPIO_Port, BoardLED_Pin);
+	HAL_Delay(20);
 
   }
   /* USER CODE END 3 */
@@ -404,7 +478,8 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     }
     else if (GPIO_Pin == KeyDown_Pin)
     {
-    	pid_integral == 0;
+    	pwm_duty = PID_DUTY_MAX;
+    	PID_Reset();
 		HAL_GPIO_TogglePin(IOEN_GPIO_Port, IOEN_Pin);
     }
 }

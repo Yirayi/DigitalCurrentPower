@@ -38,7 +38,8 @@
  * CALnew = CAL*0.98733 = 2527.6 = 0x09E0
  */
 //#define INA226_CALIB_VAL    0x0A00
-#define INA226_CALIB_VAL    0x09E0
+//#define INA226_CALIB_VAL    0x09E0
+#define INA226_CALIB_VAL    0x09E5
 #define INA226_CURRENT_LSB  0.0001f   /* 100μA/bit */
 
 /*
