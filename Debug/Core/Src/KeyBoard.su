@@ -1,0 +1,7 @@
+../Core/Src/KeyBoard.c:44:19:Keyboard_Init	16	static
+../Core/Src/KeyBoard.c:66:19:Keyboard_ReadRaw	32	static
+../Core/Src/KeyBoard.c:107:6:Keyboard_GetKey	16	static
+../Core/Src/KeyBoard.c:136:6:Keyboard_PrintAllKeys	72	static
+../Core/Src/KeyBoard.c:158:6:initIset	24	static
+../Core/Src/KeyBoard.c:165:6:storeIset	32	static
+../Core/Src/KeyBoard.c:180:6:getIset	40	static

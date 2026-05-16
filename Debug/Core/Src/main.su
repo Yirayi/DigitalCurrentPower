@@ -1,0 +1,13 @@
+../Core/Src/main.c:106:6:PID_Reset	4	static
+../Core/Src/main.c:117:14:clampf	24	static
+../Core/Src/main.c:123:13:Set_PWM_Duty	16	static
+../Core/Src/main.c:129:6:PID_Update	40	static
+../Core/Src/main.c:158:13:CV_Update	32	static
+../Core/Src/main.c:168:6:OledRefreshData	24	static
+../Core/Src/main.c:195:6:OledKeyBoardDebug	16	static
+../Core/Src/main.c:206:6:OledDebugRefreshData	32	static
+../Core/Src/main.c:232:5:main	32	static
+../Core/Src/main.c:348:6:SystemClock_Config	88	static
+../Core/Src/main.c:391:6:HAL_I2C_MemRxCpltCallback	16	static
+../Core/Src/main.c:396:6:HAL_GPIO_EXTI_Callback	16	static
+../Core/Src/main.c:417:6:Error_Handler	4	static,ignoring_inline_asm
