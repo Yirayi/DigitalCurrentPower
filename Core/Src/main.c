@@ -26,6 +26,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+//github@Yirayi
 #include "oled.h"
 #include "KeyBoard.h"
 #include "INA226.h"
@@ -318,6 +319,7 @@ int main(void)
   MX_TIM1_Init();
   MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
+    //github@Yirayi
   	//PWM输出
 	HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
 	__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, DEFAULT_DUTY*PID_DUTY_MAX);
